@@ -79,7 +79,7 @@ class DiffusionAntibodyDesign(nn.Module):
 
         return res_feat, pair_feat, R, p
     
-    def forward(self, batch):
+    def forward(self, batch, energies, it, start_tb_after):
         mask_generate = batch['generate_flag']
         mask_res = batch['mask']
         res_feat, pair_feat, R_0, p_0 = self.encode(
@@ -94,6 +94,9 @@ class DiffusionAntibodyDesign(nn.Module):
             v_0, p_0, s_0, res_feat, pair_feat, mask_generate, mask_res,
             denoise_structure = self.cfg.get('train_structure', True),
             denoise_sequence  = self.cfg.get('train_sequence', True),
+            energies = energies,
+            it = it,
+            start_tb_after = start_tb_after
         )
         return loss_dict
 

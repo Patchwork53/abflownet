@@ -1,6 +1,6 @@
 mode: single_cdr
 model:
-  checkpoint: ./trained_models/codesign_single.pt
+  checkpoint: ./trained_models/abflownet.pt
 
 sampling:
   seed: 2022

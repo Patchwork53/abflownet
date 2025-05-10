@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
 from ..utils.protein import parsers
-from .sabdab import _label_heavy_chain_cdr, _label_light_chain_cdr
+from .sabdab_rabd import _label_heavy_chain_cdr, _label_light_chain_cdr
 from ._base import register_dataset
 
 

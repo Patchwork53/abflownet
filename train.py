@@ -2,6 +2,7 @@ import os
 import shutil
 import argparse
 import torch
+import pickle
 import torch.utils.tensorboard
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -87,9 +88,19 @@ if __name__ == '__main__':
         optimizer.load_state_dict(ckpt['optimizer'])
         logger.info('Resuming scheduler states...')
         scheduler.load_state_dict(ckpt['scheduler'])
-
+        
+    def get_energies(batch_pdb_ids, precomputed_energies):
+        energies = []
+        DEFAULT_ENERGY = 1e+5
+        for pdb_id in batch_pdb_ids:
+            normalized_id = pdb_id.split('_')[0]
+            energy = precomputed_energies.get(normalized_id, DEFAULT_ENERGY) 
+            energies.append(energy)
+        energies = torch.tensor(energies, dtype=torch.float32, device=args.device)
+        return energies
+    
     # Train
-    def train(it):
+    def train(it, precomputed_energies):        
         time_start = current_milli_time()
         model.train()
 
@@ -98,7 +109,8 @@ if __name__ == '__main__':
 
         # Forward
         # if args.debug: torch.set_anomaly_enabled(True)
-        loss_dict = model(batch)
+        print(config.train.start_tb_after)
+        loss_dict = model(batch, energies=get_energies(batch['pdb_id'], precomputed_energies), it=it, start_tb_after=config.train.start_tb_after)
         loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
         loss_dict['overall'] = loss
         time_forward_end = current_milli_time()
@@ -131,7 +143,7 @@ if __name__ == '__main__':
             raise KeyboardInterrupt()
 
     # Validate
-    def validate(it):
+    def validate(it, precomputed_energies):
         loss_tape = ValidationLossTape()
         with torch.no_grad():
             model.eval()
@@ -139,7 +151,7 @@ if __name__ == '__main__':
                 # Prepare data
                 batch = recursive_to(batch, args.device)
                 # Forward
-                loss_dict = model(batch)
+                loss_dict = model(batch, energies=get_energies(batch['pdb_id'], precomputed_energies), it=it, start_tb_after=config.train.start_tb_after)
                 loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
                 loss_dict['overall'] = loss
 
@@ -153,11 +165,18 @@ if __name__ == '__main__':
             scheduler.step()
         return avg_loss
 
+    pkl_path = 'precomputed_energies.pkl'
+    if os.path.exists(pkl_path):
+        with open(pkl_path, 'rb') as f:
+            precomputed_energies = pickle.load(f)
+    else:
+        raise FileNotFoundError(f"Pickle file {pkl_path} not found. Please generate it first.")
+
     try:
         for it in range(it_first, config.train.max_iters + 1):
-            train(it)
+            train(it, precomputed_energies=precomputed_energies)
             if it % config.train.val_freq == 0:
-                avg_val_loss = validate(it)
+                avg_val_loss = validate(it, precomputed_energies=precomputed_energies, start_tb_after=config.train.start_tb_after)
                 if not args.debug:
                     ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
                     torch.save({

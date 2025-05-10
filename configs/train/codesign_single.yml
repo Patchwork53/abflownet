@@ -14,7 +14,9 @@ train:
     rot: 1.0
     pos: 1.0
     seq: 1.0
+    tb : 0.000005
   max_iters: 200_000
+  start_tb_after: 195_000
   val_freq: 1000
   batch_size: 16
   seed: 2022

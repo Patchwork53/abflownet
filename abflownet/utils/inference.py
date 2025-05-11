@@ -32,7 +32,9 @@ def get_residue_first_last(data):
     residue_first = (data['chain_id'][idx_first], data['resseq'][idx_first].item(), data['icode'][idx_first])
     residue_last = (data['chain_id'][idx_last], data['resseq'][idx_last].item(), data['icode'][idx_last])
     return residue_first, residue_last
-
+    
+def prepare_data(df):
+    return combined_df
 
 class RemoveNative(object):
 

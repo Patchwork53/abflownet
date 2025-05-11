@@ -47,19 +47,17 @@ The code for loading the DiffAb test complexes are in `diffab/datasets/sabdab_di
 
 ## Visualization of Proteins
 
-For the visualization of antibody–antigen interactions, we used the 5MES protein complex. This structure features a broadly neutralizing antibody bound to the HIV-1 envelope glycoprotein (gp120), offering a clear view of the paratope-epitope interface.
-
-To create publication-quality visualizations, we used [**PyMOL**](https://pymol.org/). The following script can be used to generate a consistent view highlighting specific complementarity-determining regions (CDRs), with general placeholders that can be adapted for different structures or regions of interest.
+For the visualization of antibody–antigen interactions, we used the 5MES protein complex. This structure features a broadly neutralizing antibody bound to the HIV-1 envelope glycoprotein (gp120), offering a clear view of the paratope-epitope interface. We used [**PyMOL**](https://pymol.org/). The following script can be used to generate a consistent view highlighting specific complementarity-determining regions (CDRs).
 
 Save the following as a `.pml` script and run it in PyMOL after loading the desired PDB:
 
 ```pml
 # Load the structure
-load /mnt/data/your_structure.pdb
+load /path/to/your_structure.pdb
 
 # Select antigen and antibody chains
-select antigen, chain a
-select antibody, chain A+B
+select antigen, chain <antigen chain>
+select antibody, chain <antibody chain>
 
 # Hide default visuals
 hide everything, all
@@ -75,14 +73,14 @@ set cartoon_smooth_loops, on
 set cartoon_flat_sheets, 1
 set cartoon_transparency, 0.2, antibody
 
-# Highlight region of interest (customize as needed)
-select region_of_interest, chain A and resi 95-102
-show sticks, region_of_interest
-color yellow, region_of_interest
-
 # Color everything else white
 color white, antigen
 color white, antibody
+
+# Highlight region of interest (customize as needed)
+select <region_of_interest>, chain <antibody chain> and resi <residue region>
+show sticks, <region_of_interest>
+color red, <region_of_interest>
 
 # Enhance visualization settings
 bg_color white
@@ -91,12 +89,12 @@ set two_sided_lighting, on
 set ambient, 0.18
 set specular, 0.3
 set shininess, 50
-set reflect, 0.05
+set reflect, 0.2
 set antialias, 2
 
 # Focus view on the region of interest
-orient region_of_interest
-zoom region_of_interest, 10
+orient <region_of_interest>
+zoom <region_of_interest>, 10
 
 # Export high-resolution image
 ray 3000, 3000

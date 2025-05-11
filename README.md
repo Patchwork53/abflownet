@@ -43,3 +43,61 @@ Run `./generate_test.sh` to generate CDRs on the 58 RAbD test complexes using `t
 
 ## Switching to DiffAb test complexes
 The code for loading the DiffAb test complexes are in `diffab/datasets/sabdab_diffab.py`
+
+
+## Visualization of Proteins
+
+For the visualization of antibody–antigen interactions, we used the 5MES protein complex. This structure features a broadly neutralizing antibody bound to the HIV-1 envelope glycoprotein (gp120), offering a clear view of the paratope-epitope interface. The antibody chains are denoted as chains A and B, while the antigen is represented by chain a. 
+
+To create publication-quality visualizations, we used **PyMOL**. The following script can be used to generate a consistent view highlighting specific complementarity-determining regions (CDRs), with general placeholders that can be adapted for different structures or regions of interest.
+
+Save the following as a `.pml` script and run it in PyMOL after loading the desired PDB:
+
+```pml
+# Load the structure
+load /mnt/data/your_structure.pdb
+
+# Select antigen and antibody chains
+select antigen, chain a
+select antibody, chain A+B
+
+# Hide default visuals
+hide everything, all
+
+# Show antigen as transparent surface
+show surface, antigen
+set transparency, 0.05, antigen
+set surface_quality, 1
+
+# Show antibody as cartoon
+show cartoon, antibody
+set cartoon_smooth_loops, on
+set cartoon_flat_sheets, 1
+set cartoon_transparency, 0.2, antibody
+
+# Highlight region of interest (customize as needed)
+select region_of_interest, chain A and resi 95-102
+show sticks, region_of_interest
+color yellow, region_of_interest
+
+# Color everything else white
+color white, antigen
+color white, antibody
+
+# Enhance visualization settings
+bg_color white
+set ray_opaque_background, off
+set two_sided_lighting, on
+set ambient, 0.18
+set specular, 0.3
+set shininess, 50
+set reflect, 0.05
+set antialias, 2
+
+# Focus view on the region of interest
+orient region_of_interest
+zoom region_of_interest, 10
+
+# Export high-resolution image
+ray 3000, 3000
+png final_visualization.png, dpi=600

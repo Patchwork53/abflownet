@@ -47,9 +47,9 @@ The code for loading the DiffAb test complexes are in `diffab/datasets/sabdab_di
 
 ## Visualization of Proteins
 
-For the visualization of antibody–antigen interactions, we used the 5MES protein complex. This structure features a broadly neutralizing antibody bound to the HIV-1 envelope glycoprotein (gp120), offering a clear view of the paratope-epitope interface. The antibody chains are denoted as chains A and B, while the antigen is represented by chain a. 
+For the visualization of antibody–antigen interactions, we used the 5MES protein complex. This structure features a broadly neutralizing antibody bound to the HIV-1 envelope glycoprotein (gp120), offering a clear view of the paratope-epitope interface.
 
-To create publication-quality visualizations, we used **PyMOL**. The following script can be used to generate a consistent view highlighting specific complementarity-determining regions (CDRs), with general placeholders that can be adapted for different structures or regions of interest.
+To create publication-quality visualizations, we used [**PyMOL**](https://pymol.org/). The following script can be used to generate a consistent view highlighting specific complementarity-determining regions (CDRs), with general placeholders that can be adapted for different structures or regions of interest.
 
 Save the following as a `.pml` script and run it in PyMOL after loading the desired PDB:
 

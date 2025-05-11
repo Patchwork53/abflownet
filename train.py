@@ -10,11 +10,11 @@ from tqdm.auto import tqdm
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from diffab.datasets import get_dataset
-from diffab.models import get_model
-from diffab.utils.misc import *
-from diffab.utils.data import *
-from diffab.utils.train import *
+from abflownet.datasets import get_dataset
+from abflownet.models import get_model
+from abflownet.utils.misc import *
+from abflownet.utils.data import *
+from abflownet.utils.train import *
 
 
 if __name__ == '__main__':
@@ -109,7 +109,7 @@ if __name__ == '__main__':
 
         # Forward
         # if args.debug: torch.set_anomaly_enabled(True)
-        print(config.train.start_tb_after)
+        # print(config.train.start_tb_after)
         loss_dict = model(batch, energies=get_energies(batch['pdb_id'], precomputed_energies), it=it, start_tb_after=config.train.start_tb_after)
         loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
         loss_dict['overall'] = loss

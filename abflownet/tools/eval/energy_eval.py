@@ -26,4 +26,4 @@ def rank_top1_and_compute_mean(csv_path, method):
     print(f"Mean CDR-Ag ΔG : {mean_dG_gen:.3f}\n")
 
 
-rank_top1_and_compute_mean("./energymetric.csv",method="AbFlowNet")
+rank_top1_and_compute_mean("./energymetric.csv",method="method")

@@ -40,6 +40,14 @@ The trained model weights are in `trained_models`
 
 Run `./generate_test.sh` to generate CDRs on the 58 RAbD test complexes using `trained_models\abflownet.pt`
 
+### For energy calculation
+`python ./abflownet/tools/eval/run.py --pfx="" --root <path to generated pdbs>`
+
+A `summary.csv` will be created in the same directory where generated pdbs are.
+
+run `energy_eval.py` and give the path of the generated `summary.csv` as `--csv_path` as input argument.
+
+
 
 ## Switching to DiffAb test complexes
 The code for loading the DiffAb test complexes are in `diffab/datasets/sabdab_diffab.py`

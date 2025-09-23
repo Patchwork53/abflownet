@@ -11,7 +11,17 @@ pyrosetta.init(' '.join([
     '-no_fconfig',
 ]))
 
-from tools.eval.base import EvalTask
+# from tools.eval.base import EvalTask
+from base import EvalTask
+import pyrosetta
+
+def compute_total_energy(pdb_path):
+    ### this part might randomly throw an error if the PDB has three co-linear atoms. https://forum.rosettacommons.org/node/10200
+    # exclude those PDBs or use a try-except block
+    pose = pyrosetta.pose_from_pdb(pdb_path)
+    score_function = pyrosetta.get_fa_scorefxn()  
+    energy = score_function(pose) + 1e-8
+    return energy
 
 
 def pyrosetta_interface_energy(pdb_path, interface):
@@ -20,6 +30,7 @@ def pyrosetta_interface_energy(pdb_path, interface):
     mover.set_pack_separated(True)
     mover.apply(pose)
     return pose.scores['dG_separated']
+
 
 
 def eval_interface_energy(task: EvalTask):
@@ -33,7 +44,9 @@ def eval_interface_energy(task: EvalTask):
     interface = f"{antibody_chains}_{antigen_chains}"
 
     dG_gen = pyrosetta_interface_energy(task.in_path, interface)
-    dG_ref = pyrosetta_interface_energy(task.ref_path, interface)
+    # dG_ref = pyrosetta_interface_energy(task.ref_path, interface)
+    dG_ref = compute_total_energy(task.in_path)
+    # print(dG_ref)
 
     task.scores.update({
         'dG_gen': dG_gen,

@@ -60,50 +60,118 @@ For the visualization of antibody–antigen interactions, we used the 5MES prote
 Save the following as a `.pml` script and run it in PyMOL after loading the desired PDB:
 
 ```pml
-# Load the structure
-load /path/to/your_structure.pdb
-
-# Select antigen and antibody chains
-select antigen, chain <antigen chain>
-select antibody, chain <antibody chain>
-
-# Hide default visuals
-hide everything, all
-
-# Show antigen as transparent surface
-show surface, antigen
-set transparency, 0.05, antigen
-set surface_quality, 1
-
-# Show antibody as cartoon
-show cartoon, antibody
-set cartoon_smooth_loops, on
-set cartoon_flat_sheets, 1
-set cartoon_transparency, 0.2, antibody
-
-# Color everything else white
-color white, antigen
-color white, antibody
-
-# Highlight region of interest (customize as needed)
-select <region_of_interest>, chain <antibody chain> and resi <residue region>
-show sticks, <region_of_interest>
-color red, <region_of_interest>
-
-# Enhance visualization settings
+load 5mes_H3/0047.pdb, complex
+hide all
 bg_color white
-set ray_opaque_background, off
+
+# --- Chain assignments (based on your file: H=D, L=C, Ag=B) ---
+select heavy, chain H
+select light, chain L
+select antigen, chain A
+select antibody, heavy or light
+
+# --- Base Visualization ---
+show cartoon, antibody
+show surface, antigen
+
+# Set high transparency for the *entire* antigen first
+# (The contacting parts will be made opaque later)
+set transparency, 0.7, antigen 
+
+#   Color Reset & CDR Definitions
+color gray80, antibody
+
+# Heavy chain (Chain D) CDRs 
+select CDR_H1, heavy and resi 26-32
+select CDR_H2, heavy and resi 52-56
+select CDR_H3, heavy and resi 95-102
+
+# Light chain (Chain C) CDRs 
+select CDR_L1, light and resi 24-34
+select CDR_L2, light and resi 50-56
+select CDR_L3, light and resi 89-97
+
+# --- Group CDRs for easy selection ---
+select CDRs_all, CDR_H1 or CDR_H2 or CDR_H3 or CDR_L1 or CDR_L2 or CDR_L3
+select CDRs_focus, CDR_H3
+select CDRs_other, CDRs_all and not CDRs_focus
+select Framework, antibody and not CDRs_all
+
+# --- CDR COLORS ---
+color gray50, CDRs_other
+
+# Color CDR H3 by hydrophobicity to match antigen surface
+select CDR_H3_hydrophobic, CDR_H3 and (resn ALA,VAL,LEU,ILE,PHE,TRP,MET,PRO,GLY,CYS)
+select CDR_H3_hydrophilic, CDR_H3 and not CDR_H3_hydrophobic
+
+color green, CDR_H3_hydrophobic   
+color red, CDR_H3_hydrophilic   
+
+# color marine, CDR_L3
+
+# Make non-key antibody parts transparent to focus on CDR3
+set cartoon_transparency, 0.7, Framework
+set cartoon_transparency, 0.7, CDRs_other
+
+# Define the Interface based ONLY on CDR3s
+select ab_interface, (CDRs_focus within 4.5 of antigen)
+select ag_interface, (antigen within 4.5 of CDRs_focus)
+select interface, ab_interface or ag_interface
+
+# Show Interface Sidechains (Opaque)
+show sticks, interface
+set stick_radius, 0.15
+# util.cnc("interface") # Color sticks by element
+
+#   Find and Color Interactions
+
+# --- SALT BRIDGES (Magenta) ---
+select ab_pos, (ab_interface and (resn LYS,ARG))
+select ab_neg, (ab_interface and (resn ASP,GLU))
+select ag_pos, (ag_interface and (resn LYS,ARG))
+select ag_neg, (ag_interface and (resn ASP,GLU))
+
+dist salt_bridges, (ab_pos and elem N), (ag_neg and elem O), 4.0
+dist salt_bridges, (ab_neg and elem O), (ag_pos and elem N), 4.0
+color magenta, salt_bridges
+
+# --- HYDROGEN BONDS (Green) ---
+select H_bond_donors, (ab_interface and (elem N,O) and not (ab_pos or ab_neg))
+select H_bond_acceptors, (ag_interface and (elem N,O) and not (ag_pos or ag_neg))
+select H_bond_donors_ag, (ag_interface and (elem N,O) and not (ag_pos or ag_neg))
+select H_bond_acceptors_ab, (ab_interface and (elem N,O) and not (ab_pos or ab_neg))
+
+dist H_bonds, H_bond_donors, H_bond_acceptors, 3.2
+dist H_bonds, H_bond_donors_ag, H_bond_acceptors_ab, 3.2
+color green, H_bonds
+
+# --- HYDROPHOBIC POCKETS (Orange) ---
+select ag_hydrophobic, (ag_interface and (resn ALA,VAL,LEU,ILE,PHE,TRP,MET,PRO,GLY,CYS))
+select ag_polar, (ag_interface and not ag_hydrophobic)
+
+# --- Color the antigen surface patches ---
+# Define custom lighter colors
+set_color light_yellow, [1.0, 1.0, 0.7]
+set_color light_orange, [1.0, 0.8, 0.6]
+
+color gray80, antigen         
+color light_orange, ag_polar    
+color light_yellow, ag_hydrophobic 
+
+set transparency, 0.0, ag_interface
+
+#   Polish & Output
+set dash_gap, 0.15
+set dash_width, 2
+set surface_quality, 1
+set cartoon_fancy_helices, 1
+set cartoon_fancy_sheets, 1
 set two_sided_lighting, on
-set ambient, 0.18
-set specular, 0.3
-set shininess, 50
-set reflect, 0.2
+set spec_power, 70
 set antialias, 2
 
-# Focus view on the region of interest
-orient <region_of_interest>
-zoom <region_of_interest>, 10
+zoom (ag_interface or CDRs_focus), 1.2
 
-# Export high-resolution image
-ray 3000, 3000
-png final_visualization.png, dpi=600
+# ray 1200, 1200
+# png final_figure.png, dpi=300
+```

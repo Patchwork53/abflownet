@@ -15,25 +15,64 @@ The default `cudatoolkit` version is 11.3. You may change it in [`env.yaml`](./e
 
 ### Datasets and Trained Weights
 
-Protein structures in the `SAbDab` dataset can be downloaded [**here**](https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/archive/all/). Extract `all_structures.zip` into the `data` folder. 
+**Data download, complex extraction, FastRelax, and InterfaceAnalyzer ΔG** are documented in [`data/README.md`](./data/README.md).
 
-The `data` folder contains a snapshot of the dataset index (`sabdab_summary_all.tsv`). You may replace the index with the latest version [**here**](https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/summary/all/).
+Short path:
 
-Trained model weights are available [**here** (Hugging Face)](https://huggingface.co/luost26/DiffAb/tree/main) or [**here** (Google Drive)](https://drive.google.com/drive/folders/15ANqouWRTG2UmQS_p0ErSsrKsU4HmNQc?usp=sharing).
+1. Download Chothia PDBs → `data/all_structures/chothia/`
+2. Extract one Ab–Ag complex per SAbDab row → `data/chothia_complexes/`
+3. Constrained FastRelax + InterfaceAnalyzer → `data/fastrelax_cache/`
+4. Train on relaxed PDBs with `precomputed_energies.pkl` (see config)
 
+The `data` folder includes a snapshot index (`sabdab_summary_all.tsv`). You may replace it with the latest [SAbDab summary](https://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/summary/all/).
+
+Trained model weights: [Hugging Face (DiffAb)](https://huggingface.co/luost26/DiffAb/tree/main) or [Google Drive](https://drive.google.com/drive/folders/15ANqouWRTG2UmQS_p0ErSsrKsU4HmNQc?usp=sharing).
 
 ### [Optional] PyRosetta
 
-PyRosetta is required to relax the generated structures and compute binding energy. Please follow the instruction [**here**](https://www.pyrosetta.org/downloads) to install.
+PyRosetta is required for FastRelax / binding-energy precompute and for relaxing generated structures. Install from [pyrosetta.org](https://www.pyrosetta.org/downloads).
 
 
 ## Train AbFlowNet (For RAbD Benchmarking)
 
-```
-python train.py configs/train/codesign_single.yml
+### 1) Structures + ΔG rewards
+
+Follow [`data/README.md`](./data/README.md). After FastRelax finishes:
+
+```bash
+# Prefer entry-id keys; drop extreme outliers before training if needed
+cp data/fastrelax_cache/precomputed_energies.pkl precomputed_energies.pkl
 ```
 
-Default training parameters `max_iters=200_000`, `start_tb_after=195_000` and `train.loss_weights.tb=0.000005` are set in `configs/train/codesign_single.yml` file. We precomputed the binding energies with PyRosetta and saved the results in `precomputed_energies.pkl`, used in `train.py`.
+`configs/train/codesign_single.yml` points `chothia_dir` at `data/fastrelax_cache/relaxed` with `structure_name: entry_id`.
+
+> The historically shipped `precomputed_energies.pkl` stores total Rosetta scores, **not** InterfaceAnalyzer ΔG.
+
+### 2) Train
+
+```bash
+export PATH="$CONDA_PREFIX/bin:$PATH"   # mmseqs for first-time LMDB clustering
+CUDA_VISIBLE_DEVICES=0 python -u train.py configs/train/codesign_single.yml \
+  --energies precomputed_energies.pkl \
+  --tag abflownet_relaxed \
+  --device cuda
+```
+
+Default training parameters `max_iters=200_000`, `start_tb_after=195_000`, `lr=1e-6` and `train.loss_weights.tb=0.000005` are set in `configs/train/codesign_single.yml`.
+
+### Trajectory Balance implementation notes
+
+The TB term matches the paper:
+
+\[
+L_{\mathrm{TB}}=\Bigl(\log Z_\theta+\sum_t\log p_\theta(S^{t-1}|S^t)-\log R(S^0)-\sum_t\log q(S^t|S^{t-1})\Bigr)^2
+\]
+
+Key details vs an earlier broken revision of this repo:
+- residual is **squared** (not a signed mean)
+- reverse log-probs are evaluated on the **same** forward trajectory states (not freshly sampled reverse states)
+- reward uses \(\alpha=10^{-2}\) once: \(\log R=-\alpha\cdot\Delta G\)
+- gradients flow through **one** random diffusion step per update
 
 ## Test On RAbD
 The trained model weights are in `trained_models`

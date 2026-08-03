@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import functools
+from contextlib import nullcontext
 from tqdm.auto import tqdm
 
 from abflownet.modules.common.geometry import apply_rotation_to_vector, quaternion_1ijk_to_rotation_matrix
@@ -118,6 +119,7 @@ class FullDPM(nn.Module):
         trans_seq_opt={},
         position_mean=[0.0, 0.0, 0.0],
         position_scale=[10.0],
+        log_Z_mode='conditional',
     ):
         super().__init__()
         self.eps_net = EpsilonNet(res_feat_dim, pair_feat_dim, **eps_net_opt)
@@ -129,10 +131,25 @@ class FullDPM(nn.Module):
         self.register_buffer('position_mean', torch.FloatTensor(position_mean).view(1, 1, -1))
         self.register_buffer('position_scale', torch.FloatTensor(position_scale).view(1, 1, -1))
         self.register_buffer('_dummy', torch.empty([0, ]))
-        
-        # Partition function for TB loss (log Z)
-        # intialize self.logZ to be a learnable parameter, randomly initialized
-        self.log_Z = nn.Parameter(torch.randn(1))
+
+        # TB partition function: 'conditional' (default) or 'global' (paper scalar).
+        if log_Z_mode not in ('conditional', 'global'):
+            raise ValueError(
+                f"log_Z_mode must be 'conditional' or 'global', got {log_Z_mode!r}"
+            )
+        self.log_Z_mode = log_Z_mode
+        if log_Z_mode == 'conditional':
+            # log Z_θ(x): per antigen/framework context
+            self.log_Z_net = nn.Sequential(
+                nn.Linear(res_feat_dim, res_feat_dim),
+                nn.SiLU(),
+                nn.Linear(res_feat_dim, 1),
+            )
+            self.log_Z = None
+        else:
+            # Single scalar Z over the whole distribution (paper)
+            self.log_Z = nn.Parameter(torch.zeros(1))
+            self.log_Z_net = None
 
     def _normalize_position(self, p):
         p_norm = (p - self.position_mean) / self.position_scale
@@ -142,13 +159,114 @@ class FullDPM(nn.Module):
         p = p_norm * self.position_scale + self.position_mean
         return p
 
+    def _conditional_log_Z(self, res_feat, mask_generate, mask_res):
+        """log Z_θ(x) from pooled context residues (not the generated CDR).
 
-    def clampped_one_hot(x, num_classes):
-        mask = (x >= 0) & (x < num_classes) # (N, L)
-        x = x.clamp(min=0, max=num_classes-1)
-        y = F.one_hot(x, num_classes) * mask[...,None]  # (N, L, C)
-        return y
+        Args:
+            res_feat: (N, L, D)
+            mask_generate: (N, L) True on designed CDR sites
+            mask_res: (N, L) True on valid residues
+        Returns:
+            log_Z: (N,)
+        """
+        ctx_mask = mask_res & ~mask_generate
+        denom = ctx_mask.sum(dim=1, keepdim=True).clamp(min=1).to(res_feat.dtype)
+        pooled = (res_feat * ctx_mask.unsqueeze(-1).to(res_feat.dtype)).sum(dim=1) / denom
+        return self.log_Z_net(pooled).squeeze(-1)
 
+    def _compute_log_Z(self, res_feat, mask_generate, mask_res):
+        """Return log Z with shape (N,) for the active log_Z_mode."""
+        N = res_feat.shape[0]
+        if self.log_Z_mode == 'conditional':
+            return self._conditional_log_Z(res_feat, mask_generate, mask_res)
+        return self.log_Z.expand(N)
+
+    def _trajectory_balance_loss(
+        self,
+        v_0, p_0, s_0,
+        res_feat, pair_feat,
+        mask_generate, mask_res,
+        denoise_structure, denoise_sequence,
+        energies,
+    ):
+        """Trajectory Balance loss (paper Eq. TB / loss_combo).
+
+        Builds a full noising trajectory under q, then evaluates
+        log p_θ(S^{t-1}|S^t) on those same states. Gradients flow through
+        one randomly chosen timestep only (paper appendix).
+        """
+        N = res_feat.shape[0]
+        device = v_0.device
+
+        # --- Forward trajectory under q (no model params) ---
+        with torch.no_grad():
+            v_traj = [v_0.detach()]
+            p_traj = [p_0.detach()]
+            s_traj = [s_0.detach()]
+            forward_logprob = []
+
+            for step in range(1, self.num_steps + 1):
+                t_current = torch.full((N,), step, dtype=torch.long, device=device)
+
+                if denoise_structure:
+                    v_noisy, _, rot_fp = self.trans_rot.add_noise_step_wise(
+                        v_traj[-1], mask_generate, t_current, return_prob=True
+                    )
+                    p_noisy, _, pos_fp = self.trans_pos.add_noise_step_wise(
+                        p_traj[-1], mask_generate, t_current, return_prob=True
+                    )
+                else:
+                    v_noisy, p_noisy = v_traj[-1], p_traj[-1]
+                    rot_fp = torch.zeros(N, mask_generate.size(1), device=device)
+                    pos_fp = torch.zeros(N, mask_generate.size(1), device=device)
+
+                if denoise_sequence:
+                    _, s_noisy, seq_fp = self.trans_seq.add_noise_step_wise(
+                        s_traj[-1], mask_generate, t_current, return_prob=True
+                    )
+                else:
+                    s_noisy = s_traj[-1]
+                    seq_fp = torch.zeros(N, mask_generate.size(1), device=device)
+
+                v_traj.append(v_noisy)
+                p_traj.append(p_noisy)
+                s_traj.append(s_noisy)
+                # Product over CDR sites → sum of log-probs, shape (N,)
+                forward_logprob.append((seq_fp + pos_fp + rot_fp).sum(dim=-1))
+
+            sum_log_q = torch.stack(forward_logprob, dim=1).sum(dim=1)
+
+        # --- Reverse log-probs on the same trajectory ---
+        # L_TB = (log Z + Σ log p_θ - log R - Σ log q)^2
+        # R(S^0) = exp(-α · BindingEnergy), α = 10^{-2}
+        # log Z is either Z_θ(x) (conditional) or a global scalar.
+        alpha = 1e-2
+        log_R = -alpha * energies
+        log_Z = self._compute_log_Z(res_feat, mask_generate, mask_res)
+
+        backward_logprob = []
+        step_when_to_backprop = random.randint(1, self.num_steps)
+
+        for step in range(1, self.num_steps + 1):
+            v_t, p_t, s_t = v_traj[step], p_traj[step], s_traj[step]
+            v_tm1, p_tm1, s_tm1 = v_traj[step - 1], p_traj[step - 1], s_traj[step - 1]
+
+            beta = self.trans_pos.var_sched.betas[step].expand([N])
+            t_tensor = torch.full([N], fill_value=step, dtype=torch.long, device=device)
+
+            ctx = nullcontext() if step == step_when_to_backprop else torch.no_grad()
+            with ctx:
+                v_pred, _, eps_p, c_denoised = self.eps_net(
+                    v_t, p_t, s_t, res_feat, pair_feat, beta, mask_generate, mask_res
+                )
+                rot_bp = self.trans_rot.log_prob_denoise(v_tm1, v_pred, mask_generate, t_tensor)
+                pos_bp = self.trans_pos.log_prob_denoise(p_t, p_tm1, eps_p, mask_generate, t_tensor)
+                seq_bp = self.trans_seq.log_prob_denoise(s_t, s_tm1, c_denoised, mask_generate, t_tensor)
+                backward_logprob.append((seq_bp + pos_bp + rot_bp).sum(dim=-1))
+
+        sum_log_p = torch.stack(backward_logprob, dim=1).sum(dim=1)
+        residual = log_Z + sum_log_p - log_R - sum_log_q
+        return (residual ** 2).mean()
 
     def forward(self, v_0, p_0, s_0, res_feat, pair_feat, mask_generate, mask_res, denoise_structure, denoise_sequence, energies, it, start_tb_after):
         N, L = res_feat.shape[:2]
@@ -156,114 +274,17 @@ class FullDPM(nn.Module):
         p_0 = self._normalize_position(p_0)
         loss_dict = {}
 
-
         if it > start_tb_after:
-            # forward trajectory
-            v_traj = [v_0]
-            p_traj = [p_0]
-            s_traj = [s_0]
-
-            forward_logprob_seq = []
-            forward_logprob_pos = []
-            forward_logprob_rot = []
-
-            # Construct forward trajectory
-            for step in range(1, self.num_steps+1):
-                t_current = torch.full((N,), step, dtype=torch.long, device=device)
-
-                # Add noise to structure 
-                if denoise_structure:
-                    v_noisy, _, rot_fp = self.trans_rot.add_noise_step_wise(v_traj[-1], mask_generate, t_current, return_prob=True)
-                    p_noisy, _, pos_fp = self.trans_pos.add_noise_step_wise(p_traj[-1], mask_generate, t_current, return_prob=True)
-                else:
-                    v_noisy = v_traj[-1]
-                    p_noisy = p_traj[-1]
-                    rot_fp = torch.zeros_like(mask_generate, dtype=torch.float)
-                    pos_fp = torch.zeros_like(mask_generate, dtype=torch.float)
-
-                # Add noise to sequence 
-                if denoise_sequence:
-                    _, s_noisy, seq_fp = self.trans_seq.add_noise_step_wise(s_traj[-1], mask_generate, t_current, return_prob=True)
-                else:
-                    s_noisy = s_traj[-1]
-                    seq_fp = torch.zeros_like(mask_generate, dtype=torch.float)
-
-                v_traj.append(v_noisy)
-                p_traj.append(p_noisy)
-                s_traj.append(s_noisy)
-    
-                forward_logprob_seq.append(seq_fp)
-                forward_logprob_pos.append(pos_fp)
-                forward_logprob_rot.append(rot_fp)
-
-            # Compute backward probabilities
-            backward_logprob_seq = []
-            backward_logprob_pos = []
-            backward_logprob_rot = []
-
-            step_when_to_backprop = random.randint(1, self.num_steps)
-            # Backward
-            for step in range(self.num_steps, 0, -1):
-                v_t, p_t, s_t = v_traj[step], p_traj[step], s_traj[step]
-
-                beta = self.trans_pos.var_sched.betas[step].expand([N, ])
-                
-                t_tensor = torch.full([N, ], fill_value=step, dtype=torch.long, device=self._dummy.device)
-
-                if step_when_to_backprop == step:
-                    # call epsilon net
-                    v_next, _ , eps_p, c_denoised = self.eps_net(
-                        v_t, p_t, s_t, res_feat, pair_feat, beta, mask_generate, mask_res
-                    )   # (N, L, 3), (N, L, 3, 3), (N, L, 3)
-                else:
-                    with torch.no_grad():
-                        v_next, _ , eps_p, c_denoised = self.eps_net(
-                            v_t, p_t, s_t, res_feat, pair_feat, beta, mask_generate, mask_res
-                        )
-
-                _, rot_bp = self.trans_rot.denoise(v_t, v_next, mask_generate, t_tensor, return_prob=True)
-                _, pos_bp = self.trans_pos.denoise(p_t, eps_p, mask_generate, t_tensor, return_prob=True)
-                _, _, seq_bp = self.trans_seq.denoise(s_t, c_denoised, mask_generate, t_tensor, return_prob=True)
-
-                backward_logprob_seq.append(seq_bp)
-                backward_logprob_pos.append(pos_bp)
-                backward_logprob_rot.append(rot_bp)
-
-            #unnecessary? summed anyway
-            backward_logprob_seq.reverse()
-            backward_logprob_pos.reverse()
-            backward_logprob_rot.reverse()
-
-            
-            # Sum forward and backward log probabilities over all steps
-            sum_forward_seq = torch.stack(forward_logprob_seq, dim=1).sum(dim=[1,2])   # (N,L)
-            sum_forward_pos = torch.stack(forward_logprob_pos, dim=1).sum(dim=[1,2])   # (N,L)
-            sum_forward_rot = torch.stack(forward_logprob_rot, dim=1).sum(dim=[1,2])   # (N,L)
-
-            sum_backward_seq = torch.stack(backward_logprob_seq, dim=1).sum(dim=[1,2])
-            sum_backward_pos = torch.stack(backward_logprob_pos, dim=1).sum(dim=[1,2])
-            sum_backward_rot = torch.stack(backward_logprob_rot, dim=1).sum(dim=[1,2])
-
-            total_forward_logprob = sum_forward_seq + sum_forward_pos + sum_forward_rot
-            total_backward_logprob = sum_backward_seq + sum_backward_pos + sum_backward_rot
-
-            # Compute TB loss
-            # energy = torch.clamp(energy, min=1e-8) * 1e-3
-
-            alpha = 1e-6
-            energies = energies * alpha
-
-            # -log_reward = -log(torch.exp(-alpha*energy)) = alpha*energy
-            
-            batch_size = energies.shape[0]
-            TB_loss = (self.log_Z.repeat(batch_size) - total_forward_logprob - total_backward_logprob + alpha*energies).mean()
-
+            loss_dict['tb'] = self._trajectory_balance_loss(
+                v_0, p_0, s_0, res_feat, pair_feat,
+                mask_generate, mask_res,
+                denoise_structure, denoise_sequence,
+                energies,
+            )
         else:
-            TB_loss = torch.tensor(0.0).to(device)
-        
-        
-        loss_dict['tb'] = TB_loss
-            
+            loss_dict['tb'] = torch.zeros((), device=device)
+
+        # DiffAb denoising losses at a random timestep (independent of TB trajectory)
         t_random = torch.randint(0, self.num_steps, (N,), dtype=torch.long, device=self._dummy.device)
 
         if denoise_structure:

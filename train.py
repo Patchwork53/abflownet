@@ -17,6 +17,28 @@ from abflownet.utils.data import *
 from abflownet.utils.train import *
 
 
+def _validate_binding_energies(energies_dict, logger):
+    """Paper reward assumes InterfaceAnalyzer ΔG roughly in [-100, 0]."""
+    vals = list(energies_dict.values())
+    if not vals:
+        raise ValueError('precomputed_energies.pkl is empty.')
+    vals_sorted = sorted(vals)
+    median = vals_sorted[len(vals_sorted) // 2]
+    frac_in_range = sum(1 for v in vals if -100.0 <= v <= 0.0) / len(vals)
+    logger.info(
+        'Binding energies: n=%d min=%.2f median=%.2f max=%.2f frac_in_[-100,0]=%.3f',
+        len(vals), vals_sorted[0], median, vals_sorted[-1], frac_in_range,
+    )
+    if median > 50.0 or frac_in_range < 0.2:
+        logger.warning(
+            'precomputed_energies.pkl does not look like InterfaceAnalyzer ΔG '
+            '(expected roughly [-100, 0]). The bundled pickle appears to store '
+            'total Rosetta scores instead. Re-run:\n'
+            '  python precompute_binding_energies.py --chothia_dir data/all_structures/chothia '
+            '--summary_path data/sabdab_summary_all.tsv --out precomputed_energies.pkl'
+        )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('config', type=str)
@@ -27,6 +49,7 @@ if __name__ == '__main__':
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--finetune', type=str, default=None)
+    parser.add_argument('--energies', type=str, default='precomputed_energies.pkl')
     args = parser.parse_args()
 
     # Load configs
@@ -37,6 +60,7 @@ if __name__ == '__main__':
     if args.debug:
         logger = get_logger('train', None)
         writer = BlackHole()
+        log_dir = None
     else:
         if args.resume:
             log_dir = os.path.dirname(os.path.dirname(args.resume))
@@ -52,18 +76,53 @@ if __name__ == '__main__':
     logger.info(args)
     logger.info(config)
 
+    # Energies (filter dataset before building DataLoaders)
+    pkl_path = args.energies
+    if not os.path.exists(pkl_path):
+        raise FileNotFoundError(
+            f'Pickle file {pkl_path} not found. Generate it with '
+            'precompute_binding_energies.py (InterfaceAnalyzer ΔG).'
+        )
+    with open(pkl_path, 'rb') as f:
+        precomputed_energies = pickle.load(f)
+    _validate_binding_energies(precomputed_energies, logger)
+
+    def _has_energy(pdb_id, energy_table):
+        return pdb_id in energy_table or pdb_id.split('_')[0] in energy_table
+
     # Data
     logger.info('Loading dataset...')
     train_dataset = get_dataset(config.dataset.train)
     val_dataset = get_dataset(config.dataset.val)
+
+    # Drop complexes without ΔG up front. Crashing at start_tb_after is useless;
+    # silently using 0.0 would corrupt the TB reward (R=exp(0)=1).
+    n_train_before = len(train_dataset)
+    train_dataset.ids_in_split = [
+        i for i in train_dataset.ids_in_split if _has_energy(i, precomputed_energies)
+    ]
+    n_val_before = len(val_dataset)
+    val_dataset.ids_in_split = [
+        i for i in val_dataset.ids_in_split if _has_energy(i, precomputed_energies)
+    ]
+    logger.info(
+        'Energy filter: train %d -> %d | val %d -> %d',
+        n_train_before, len(train_dataset), n_val_before, len(val_dataset),
+    )
+    if len(train_dataset) == 0:
+        raise RuntimeError('No training complexes left after energy filter.')
+
     train_iterator = inf_iterator(DataLoader(
-        train_dataset, 
-        batch_size=config.train.batch_size, 
-        collate_fn=PaddingCollate(), 
+        train_dataset,
+        batch_size=config.train.batch_size,
+        collate_fn=PaddingCollate(),
         shuffle=True,
         num_workers=args.num_workers
     ))
-    val_loader = DataLoader(val_dataset, batch_size=config.train.batch_size, collate_fn=PaddingCollate(), shuffle=False, num_workers=args.num_workers)
+    val_loader = DataLoader(
+        val_dataset, batch_size=config.train.batch_size,
+        collate_fn=PaddingCollate(), shuffle=False, num_workers=args.num_workers,
+    )
     logger.info('Train %d | Val %d' % (len(train_dataset), len(val_dataset)))
 
     # Model
@@ -88,41 +147,39 @@ if __name__ == '__main__':
         optimizer.load_state_dict(ckpt['optimizer'])
         logger.info('Resuming scheduler states...')
         scheduler.load_state_dict(ckpt['scheduler'])
-        
-    def get_energies(batch_pdb_ids, precomputed_energies):
+
+    def get_energies(batch_pdb_ids, energy_table):
+        """Look up InterfaceAnalyzer ΔG for each complex (entry id or pdb code)."""
         energies = []
-        DEFAULT_ENERGY = 1e+5
         for pdb_id in batch_pdb_ids:
-            normalized_id = pdb_id.split('_')[0]
-            energy = precomputed_energies.get(normalized_id, DEFAULT_ENERGY) 
-            energies.append(energy)
-        energies = torch.tensor(energies, dtype=torch.float32, device=args.device)
-        return energies
-    
+            if pdb_id in energy_table:
+                energies.append(energy_table[pdb_id])
+            else:
+                energies.append(energy_table[pdb_id.split('_')[0]])
+        return torch.tensor(energies, dtype=torch.float32, device=args.device)
+
     # Train
-    def train(it, precomputed_energies):        
+    def train(it, energy_table):
         time_start = current_milli_time()
         model.train()
 
-        # Prepare data
         batch = recursive_to(next(train_iterator), args.device)
-
-        # Forward
-        # if args.debug: torch.set_anomaly_enabled(True)
-        # print(config.train.start_tb_after)
-        loss_dict = model(batch, energies=get_energies(batch['pdb_id'], precomputed_energies), it=it, start_tb_after=config.train.start_tb_after)
+        loss_dict = model(
+            batch,
+            energies=get_energies(batch['pdb_id'], energy_table),
+            it=it,
+            start_tb_after=config.train.start_tb_after,
+        )
         loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
         loss_dict['overall'] = loss
         time_forward_end = current_milli_time()
 
-        # Backward
         loss.backward()
         orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
         optimizer.step()
         optimizer.zero_grad()
         time_backward_end = current_milli_time()
 
-        # Logging
         log_losses(loss_dict, it, 'train', logger, writer, others={
             'grad': orig_grad_norm,
             'lr': optimizer.param_groups[0]['lr'],
@@ -142,41 +199,35 @@ if __name__ == '__main__':
             }, os.path.join(log_dir, 'checkpoint_nan_%d.pt' % it))
             raise KeyboardInterrupt()
 
-    # Validate
-    def validate(it, precomputed_energies):
+    # Validate (diffusion losses only — skip expensive TB rollouts)
+    def validate(it, energy_table):
         loss_tape = ValidationLossTape()
         with torch.no_grad():
             model.eval()
             for i, batch in enumerate(tqdm(val_loader, desc='Validate', dynamic_ncols=True)):
-                # Prepare data
                 batch = recursive_to(batch, args.device)
-                # Forward
-                loss_dict = model(batch, energies=get_energies(batch['pdb_id'], precomputed_energies), it=it, start_tb_after=config.train.start_tb_after)
+                loss_dict = model(
+                    batch,
+                    energies=get_energies(batch['pdb_id'], energy_table),
+                    it=it,
+                    start_tb_after=float('inf'),
+                )
                 loss = sum_weighted_losses(loss_dict, config.train.loss_weights)
                 loss_dict['overall'] = loss
-
                 loss_tape.update(loss_dict, 1)
 
         avg_loss = loss_tape.log(it, logger, writer, 'val')
-        # Trigger scheduler
         if config.train.scheduler.type == 'plateau':
             scheduler.step(avg_loss)
         else:
             scheduler.step()
         return avg_loss
 
-    pkl_path = 'precomputed_energies.pkl'
-    if os.path.exists(pkl_path):
-        with open(pkl_path, 'rb') as f:
-            precomputed_energies = pickle.load(f)
-    else:
-        raise FileNotFoundError(f"Pickle file {pkl_path} not found. Please generate it first.")
-
     try:
         for it in range(it_first, config.train.max_iters + 1):
-            train(it, precomputed_energies=precomputed_energies)
+            train(it, energy_table=precomputed_energies)
             if it % config.train.val_freq == 0:
-                avg_val_loss = validate(it, precomputed_energies=precomputed_energies, start_tb_after=config.train.start_tb_after)
+                avg_val_loss = validate(it, energy_table=precomputed_energies)
                 if not args.debug:
                     ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
                     torch.save({

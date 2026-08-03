@@ -208,10 +208,16 @@ class SAbDabDataset(Dataset):
         split_seed = 2022,
         transform = None,
         reset = False,
+        structure_name = 'pdbcode',
     ):
         super().__init__()
         self.summary_path = summary_path
         self.chothia_dir = chothia_dir
+        if structure_name not in ('pdbcode', 'entry_id'):
+            raise ValueError(
+                f"structure_name must be 'pdbcode' or 'entry_id', got {structure_name!r}"
+            )
+        self.structure_name = structure_name
         if not os.path.exists(chothia_dir):
             raise FileNotFoundError(
                 f"SAbDab structures not found in {chothia_dir}. "
@@ -219,6 +225,10 @@ class SAbDabDataset(Dataset):
             )
         self.processed_dir = processed_dir
         os.makedirs(processed_dir, exist_ok=True)
+        logging.info(
+            'SAbDabDataset: chothia_dir=%s structure_name=%s processed_dir=%s split=%s',
+            chothia_dir, structure_name, processed_dir, split,
+        )
 
         self.sabdab_entries = None
         self._load_sabdab_entries()
@@ -298,10 +308,14 @@ class SAbDabDataset(Dataset):
     def _structure_cache_path(self):
         return os.path.join(self.processed_dir, 'structures.lmdb')
         
+    def _structure_path(self, entry):
+        stem = entry['id'] if self.structure_name == 'entry_id' else entry['pdbcode']
+        return os.path.join(self.chothia_dir, '{}.pdb'.format(stem))
+
     def _preprocess_structures(self):
         tasks = []
         for entry in self.sabdab_entries:
-            pdb_path = os.path.join(self.chothia_dir, '{}.pdb'.format(entry['pdbcode']))
+            pdb_path = self._structure_path(entry)
             if not os.path.exists(pdb_path):
                 logging.warning(f"PDB not found: {pdb_path}")
                 continue
@@ -447,6 +461,7 @@ def get_sabdab_dataset(cfg, transform):
         split = cfg.split,
         split_seed = cfg.get('split_seed', 2022),
         transform = transform,
+        structure_name = getattr(cfg, 'structure_name', 'pdbcode'),
     )
 
 

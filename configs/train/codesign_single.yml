@@ -6,6 +6,8 @@ model:
     num_steps: 100
     eps_net_opt:
       num_layers: 6
+    # TB partition function: conditional (default) or global (paper scalar Z)
+    log_Z_mode: conditional
   train_structure: true
   train_sequence: true
 
@@ -23,7 +25,7 @@ train:
   max_grad_norm: 100.0
   optimizer:
     type: adam
-    lr: 1.e-4
+    lr: 1.e-6
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
@@ -31,14 +33,16 @@ train:
     type: plateau
     factor: 0.8
     patience: 10
-    min_lr: 5.e-6
+    min_lr: 1.e-7
 
 dataset:
   train:
     type: sabdab
     summary_path: ./data/sabdab_summary_all.tsv
-    chothia_dir: ./data/all_structures/chothia
-    processed_dir: ./data/processed
+    # FastRelax'd single-complex PDBs (same structures used for ΔG rewards)
+    chothia_dir: ./data/fastrelax_cache/relaxed
+    structure_name: entry_id
+    processed_dir: ./data/processed_relaxed
     split: train
     transform:
     - type: mask_single_cdr
@@ -47,8 +51,9 @@ dataset:
   val:
     type: sabdab
     summary_path: ./data/sabdab_summary_all.tsv
-    chothia_dir: ./data/all_structures/chothia
-    processed_dir: ./data/processed
+    chothia_dir: ./data/fastrelax_cache/relaxed
+    structure_name: entry_id
+    processed_dir: ./data/processed_relaxed
     split: val
     transform:
     - type: mask_single_cdr

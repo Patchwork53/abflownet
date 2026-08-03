@@ -31,6 +31,32 @@ class VarianceSchedule(nn.Module):
         self.register_buffer('sigmas', sigmas)
 
 
+def _gaussian_log_prob(diff, std, mask_generate, t=None, drop_t_eq_1=False):
+    """Isotropic Gaussian log-density on the last dimension (size 3).
+
+    Continuous densities may be > 1, so log-prob can be positive — do not clamp to 0.
+    When drop_t_eq_1 is set, t=1 (sigma=0, deterministic reverse step) contributes 0.
+    """
+    std_safe = std.clamp_min(1e-8)
+    var = std_safe ** 2
+    log_prob = (
+        -0.5 * torch.sum(diff ** 2 / var, dim=-1)
+        - 0.5 * 3 * torch.log(torch.tensor(2 * np.pi, device=diff.device, dtype=diff.dtype))
+        - 3 * torch.log(std_safe.squeeze(-1))
+    )
+    if drop_t_eq_1:
+        log_prob = torch.where((t > 1)[:, None], log_prob, torch.zeros_like(log_prob))
+    return torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
+
+
+def _relative_so3vec(v_sample, v_center):
+    """so3vec of the relative rotation E in R_sample = E @ R_center (DiffAb composition)."""
+    R_sample = so3vec_to_rotation(v_sample)
+    R_center = so3vec_to_rotation(v_center)
+    R_rel = R_sample @ R_center.transpose(-1, -2)
+    return rotation_to_so3vec(R_rel)
+
+
 class PositionTransition(nn.Module):
     def __init__(self, num_steps, var_sched_opt={}):
         super().__init__()
@@ -50,17 +76,14 @@ class PositionTransition(nn.Module):
 
         if return_prob:
             diff = p_noisy - c0*p_0
-            var = c1**2
-            # log p_F(p_t|p_0)
-            log_prob = -0.5*torch.sum(diff**2/var, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log(c1.squeeze(-1))
-            log_prob = torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
+            log_prob = _gaussian_log_prob(diff, c1, mask_generate)
             return p_noisy, e_rand, log_prob
         else:
             return p_noisy, e_rand
 
     def add_noise_step_wise(self, p_t_1, mask_generate, t, return_prob=False):
         """
-        Forward transition p_F(p_t|p_{t-1}) = N(p_t | \sqrt{1-β} · x_{t-1}, β*I)
+        Forward transition q(p_t|p_{t-1}) = N(p_t | sqrt(1-β)·p_{t-1}, β·I)
         """
         beta = self.var_sched.betas[t]
         c0 = torch.sqrt(1-beta).view(-1, 1, 1)
@@ -72,19 +95,14 @@ class PositionTransition(nn.Module):
 
         if return_prob:
             diff = p_noisy - c0*p_t_1
-            var = c1**2
-            # log p_F(p_t|p_t_1)
-            log_prob = -0.5*torch.sum(diff**2/var, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log(c1.squeeze(-1))
-            log_prob = torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
-            #approx gaussian but not exact. log prob must be between -inf and 0
-            log_prob = torch.clamp(log_prob, min=-1e6, max=0)
-            
+            log_prob = _gaussian_log_prob(diff, c1, mask_generate)
             return p_noisy, e_rand, log_prob
         else:
             return p_noisy, e_rand
 
 
-    def denoise(self, p_t, eps_p, mask_generate, t, return_prob=False):
+    def _denoise_params(self, p_t, eps_p, t):
+        # Match DiffAb sampling: reverse variance is the DDPM posterior sigma, not beta.
         alpha = self.var_sched.alphas[t].clamp_min(
             self.var_sched.alphas[-2]
         )
@@ -93,6 +111,16 @@ class PositionTransition(nn.Module):
 
         c0 = ( 1.0 / torch.sqrt(alpha + 1e-8) ).view(-1, 1, 1)
         c1 = ( (1 - alpha) / torch.sqrt(1 - alpha_bar + 1e-8) ).view(-1, 1, 1)
+        mu = c0 * (p_t - c1 * eps_p)
+        return mu, sigma
+
+    def log_prob_denoise(self, p_t, p_tm1, eps_p, mask_generate, t):
+        """log p_θ(p_{t-1}|p_t) evaluated at the trajectory state p_tm1."""
+        mu, sigma = self._denoise_params(p_t, eps_p, t)
+        return _gaussian_log_prob(p_tm1 - mu, sigma, mask_generate, t=t, drop_t_eq_1=True)
+
+    def denoise(self, p_t, eps_p, mask_generate, t, return_prob=False):
+        mu, sigma = self._denoise_params(p_t, eps_p, t)
 
         z = torch.where(
             (t > 1)[:, None, None].expand_as(p_t),
@@ -100,22 +128,11 @@ class PositionTransition(nn.Module):
             torch.zeros_like(p_t),
         )
 
-        p_next = c0 * (p_t - c1 * eps_p) + sigma * z
+        p_next = mu + sigma * z
         p_next = torch.where(mask_generate[..., None].expand_as(p_t), p_next, p_t)
 
         if return_prob:
-            # Calculate mean of the posterior distribution
-            mu = c0 * (p_t - c1 * eps_p)
-            
-            # Calculate log probability
-            diff = p_next - mu
-            var = sigma**2 + 1e-8
-            # log p(p_{t-1}|p_t)
-            log_prob = -0.5*torch.sum(diff**2/var, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log(sigma.squeeze(-1))
-            log_prob = torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
-            #approx gaussian but not exact. log prob must be between -inf and 0
-            log_prob = torch.clamp(log_prob, min=-1e6, max=0)
-            
+            log_prob = self.log_prob_denoise(p_t, p_next, eps_p, mask_generate, t)
             return p_next, log_prob
         else:
             return p_next
@@ -154,11 +171,9 @@ class RotationTransition(nn.Module):
         v_noisy = torch.where(mask_generate[..., None].expand_as(v_0), v_noisy, v_0)
 
         if return_prob:
-            diff = v_noisy - (c0 * v_0)
-            var = c1**2
-            # log p_F(v_t|v_0)
-            log_prob = -0.5 * torch.sum(diff**2/var, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log(c1.squeeze(-1))
-            log_prob = torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
+            # Density of the composed noise E, not a Euclidean difference of so3vecs.
+            e_rel = _relative_so3vec(v_noisy, c0 * v_0)
+            log_prob = _gaussian_log_prob(e_rel, c1, mask_generate)
             return v_noisy, e_scaled, log_prob
         else:
             return v_noisy, e_scaled
@@ -181,53 +196,29 @@ class RotationTransition(nn.Module):
         v_noisy = torch.where(mask_generate[..., None].expand_as(v_t_1), v_noisy, v_t_1)
 
         if return_prob:
-            diff = v_noisy - (c0 * v_t_1)
-            var = c1**2
-            # log q(v_t|v_{t-1})
-            log_prob = -0.5 * torch.sum(diff**2/var, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log(c1.squeeze(-1))
-            log_prob = torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
-
-            #approx gaussian but not exact. log prob must be between -inf and 0
-            log_prob = torch.clamp(log_prob, min=-1e6, max=0)
+            e_rel = _relative_so3vec(v_noisy, c0 * v_t_1)
+            log_prob = _gaussian_log_prob(e_rel, c1, mask_generate)
             return v_noisy, e_scaled, log_prob
         else:
             return v_noisy, e_scaled
 
 
-    def denoise(self, v_t, v_next, mask_generate, t):
-        # Unchanged
-        N, L = mask_generate.size()
-        e = random_normal_so3(t[:, None].expand(N, L), self.angular_distrib_inv, device=self._dummy.device)
-        e = torch.where(
-            (t > 1)[:, None, None].expand(N, L, 3),
-            e,
-            torch.zeros_like(e)
-        )
-        E = so3vec_to_rotation(e)
+    def log_prob_denoise(self, v_tm1, v_pred, mask_generate, t):
+        """log p_θ(v_{t-1}|v_t) at trajectory state v_tm1.
 
-        R_next = E @ so3vec_to_rotation(v_next)
-        v_next = rotation_to_so3vec(R_next)
-        v_next = torch.where(mask_generate[..., None].expand_as(v_next), v_next, v_t)
-
-        return v_next
+        DiffAb samples R_{t-1} = E @ R_pred with E ~ IG(sigma). Evaluate the
+        Euclidean-on-so3vec approximation on that relative rotation E.
+        """
+        sigma = self.var_sched.sigmas[t].view(-1, 1, 1)
+        e_rel = _relative_so3vec(v_tm1, v_pred)
+        return _gaussian_log_prob(e_rel, sigma, mask_generate, t=t, drop_t_eq_1=True)
 
     def denoise(self, v_t, v_next, mask_generate, t, return_prob=False):
         """
         Denoising step with optional probability calculation
-        Args:
-            v_t: Current state
-            v_next: Predicted next state
-            mask_generate: Generation mask
-            t: Time steps
-            return_prob: Whether to return probability
-        Returns:
-            v_next: Denoised state
-            e: Random noise
-            log_prob: Log probability (if return_prob=True)
         """
         N, L = mask_generate.size()
-        sigma = self.var_sched.sigmas[t].view(-1, 1, 1)
-    
+
         e = random_normal_so3(t[:, None].expand(N, L), self.angular_distrib_inv, device=self._dummy.device)
         e = torch.where(
             (t > 1)[:, None, None].expand(N, L, 3),
@@ -241,34 +232,10 @@ class RotationTransition(nn.Module):
         v_next_noisy = torch.where(mask_generate[..., None].expand_as(v_next_noisy), v_next_noisy, v_t)
 
         if return_prob:
-            diff = v_next_noisy - v_next
-            var = sigma**2 + 1e-8
-            # log p(v_{t-1}|v_t)
-            log_prob = -0.5 * torch.sum(diff**2/var, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log(sigma.squeeze(-1))
-            log_prob = torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))
-            #approx gaussian but not exact. log prob must be between -inf and 0
-            log_prob = torch.clamp(log_prob, min=-1e6, max=0)
-            
+            log_prob = self.log_prob_denoise(v_next_noisy, v_next, mask_generate, t)
             return v_next_noisy, log_prob
         else:
             return v_next_noisy
-
-
-    # def backward_prob(self, v_t, v_0, mask_generate, t):
-    #     """
-    #     Backward transition p_B(v_0|v_t)
-    #     Similarly as positions:
-    #     p_B(v_0|v_t) = N(v_0; v_t/c0, (c1^2/c0^2)*I)
-    #     """
-    #     alpha_bar = self.var_sched.alpha_bars[t]
-    #     c0 = torch.sqrt(alpha_bar).view(-1,1,1)
-    #     c1 = torch.sqrt(1 - alpha_bar).view(-1,1,1)
-
-    #     diff = v_0 - (v_t/c0)
-    #     var_b = (c1**2)/(c0**2)
-    #     log_prob_b = -0.5*torch.sum(diff**2/var_b, dim=-1) - 0.5*3*torch.log(2*torch.tensor(np.pi)) - 3*torch.log((c1/c0).squeeze(-1))
-    #     log_prob_b = torch.where(mask_generate, log_prob_b, torch.zeros_like(log_prob_b))
-    #     return log_prob_b
 
 
 class AminoacidCategoricalTransition(nn.Module):
@@ -307,38 +274,24 @@ class AminoacidCategoricalTransition(nn.Module):
 
     def add_noise_step_wise(self, x_t_1, mask_generate, t, return_prob=False):
         """
-        Step-wise forward transition p_F(x_t|x_{t-1}) for categorical data
-        
-        q(x_j^t|x_j^{t-1}) = Multinomial((1 - β_t) · onehot(x_j^{t-1}) + β_t · \frac{1}{K} · 1)
+        Step-wise forward transition q(x_t|x_{t-1}) for categorical data
+
+        q(x_j^t|x_j^{t-1}) = Multinomial((1 - β_t) · onehot(x_j^{t-1}) + β_t/K)
         """
         N, L = x_t_1.size()
         K = self.num_classes
-        
-        # Convert input to one-hot representation
+
         c_t_1 = clampped_one_hot(x_t_1, num_classes=K).float()
-        
-        # Get beta value for current timestep
         beta_t = self.var_sched.betas[t][:, None, None]
-        
-        # Calculate transition probabilities
-        # p(x_t|x_{t-1}) = (1-β_t)·onehot(x_{t-1}) + β_t/K
         c_noisy = (1 - beta_t) * c_t_1 + (beta_t/K)
-        
-        # Apply mask: keep original values for non-masked positions
         c_t = torch.where(mask_generate[..., None].expand(N,L,K), c_noisy, c_t_1)
-        
-        # Sample from the categorical distribution
         x_t = self._sample(c_t)
-        
+
         if return_prob:
-            # Calculate log probabilities for masked positions
             idx = x_t.unsqueeze(-1)
             p_x = torch.gather(c_t, dim=-1, index=idx).squeeze(-1)
-            log_p_x = torch.log(p_x + 1e-8)  # Add small epsilon for numerical stability
+            log_p_x = torch.log(p_x + 1e-8)
             log_p_x = torch.where(mask_generate, log_p_x, torch.zeros_like(log_p_x))
-            #approx gaussian but not exact. log prob must be between -inf and 0
-            log_prob = torch.clamp(log_p_x, min=-1e6, max=0)
-            
             return c_t, x_t, log_p_x
         else:
             return c_t, x_t
@@ -346,7 +299,10 @@ class AminoacidCategoricalTransition(nn.Module):
 
     def posterior(self, x_t, x_0, t):
         """
-        Posterior distribution p_B(x_0|x_t)
+        Posterior distribution q(x_{t-1}|x_t, x_0) used by DiffAb sampling.
+
+        Note: DiffAb uses alpha_bars[t] for both factors (legacy). Kept for
+        consistency between TB log-probs and the actual reverse sampler.
         """
         K = self.num_classes
 
@@ -367,48 +323,29 @@ class AminoacidCategoricalTransition(nn.Module):
         theta = theta / (theta.sum(dim=-1, keepdim=True) + 1e-8)
         return theta
 
+    def log_prob_denoise(self, x_t, x_tm1, c_0_pred, mask_generate, t):
+        """log p_θ(x_{t-1}|x_t) evaluated at the trajectory state x_tm1."""
+        c_t = clampped_one_hot(x_t, num_classes=self.num_classes).float()
+        post = self.posterior(c_t, c_0_pred, t=t)
+        post = torch.where(mask_generate[..., None].expand(post.size()), post, c_t)
+        # Non-CDR / padding residues may have aa ids outside [0, 19]; only CDR
+        # positions contribute to the log-prob.
+        idx = torch.where(mask_generate, x_tm1, torch.zeros_like(x_tm1)).unsqueeze(-1)
+        p_x = torch.gather(post, dim=-1, index=idx).squeeze(-1)
+        log_p_x = torch.log(p_x + 1e-8)
+        return torch.where(mask_generate, log_p_x, torch.zeros_like(log_p_x))
 
     def denoise(self, x_t, c_0_pred, mask_generate, t, return_prob=False):
         """
         Denoising step with option to return probability information
-        
-        Args:
-            x_t: Current state tensor
-            c_0_pred: Predicted initial state distribution
-            mask_generate: Generation mask
-            t: Current timestep
-            return_prob: Whether to return probability information
-        
-        Returns:
-            If return_prob=False:
-                post: Posterior distribution
-                x_next: Next state samples
-            If return_prob=True:
-                post: Posterior distribution
-                x_next: Next state samples
-                log_p_x: Log probabilities of selected samples
         """
-        # Convert current state to one-hot representation
         c_t = clampped_one_hot(x_t, num_classes=self.num_classes).float()
-        
-        # Calculate posterior distribution
         post = self.posterior(c_t, c_0_pred, t=t)
-        
-        # Apply mask: keep original values for non-masked positions
         post = torch.where(mask_generate[..., None].expand(post.size()), post, c_t)
-        
-        # Sample next state
         x_next = self._sample(post)
-        
+
         if return_prob:
-            # Calculate log probabilities for the selected samples
-            idx = x_next.unsqueeze(-1)
-            p_x = torch.gather(post, dim=-1, index=idx).squeeze(-1)
-            log_p_x = torch.log(p_x + 1e-8)  # Add small epsilon for numerical stability
-            log_p_x = torch.where(mask_generate, log_p_x, torch.zeros_like(log_p_x))
-            #approx gaussian but not exact. log prob must be between -inf and 0
-            log_prob = torch.clamp(log_p_x, min=-1e6, max=0)
-            
+            log_p_x = self.log_prob_denoise(x_t, x_next, c_0_pred, mask_generate, t)
             return post, x_next, log_p_x
         else:
             return post, x_next

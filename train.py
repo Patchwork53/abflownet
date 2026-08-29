@@ -131,22 +131,77 @@ if __name__ == '__main__':
     logger.info('Number of parameters: %d' % count_parameters(model))
 
     # Optimizer & scheduler
-    optimizer = get_optimizer(config.train.optimizer, model)
+    z_optimizer_cfg = config.train.get('z_optimizer', None)
+    z_named_params = [
+        (name, param) for name, param in model.named_parameters()
+        if name.startswith('diffusion.log_Z')
+    ]
+    z_param_ids = {id(param) for _, param in z_named_params}
+    policy_params = [
+        param for param in model.parameters() if id(param) not in z_param_ids
+    ]
+    z_params = [param for _, param in z_named_params]
+    if z_optimizer_cfg is not None:
+        optimizer = get_optimizer(config.train.optimizer, policy_params)
+        z_optimizer = get_optimizer(z_optimizer_cfg, z_params)
+        logger.info(
+            'Separate Z optimizer: params=%s lr=%.6g',
+            [name for name, _ in z_named_params],
+            z_optimizer.param_groups[0]['lr'],
+        )
+    else:
+        optimizer = get_optimizer(config.train.optimizer, model)
+        z_optimizer = None
+        policy_params = list(model.parameters())
     scheduler = get_scheduler(config.train.scheduler, optimizer)
     optimizer.zero_grad()
+    if z_optimizer is not None:
+        z_optimizer.zero_grad()
     it_first = 1
+    calibration_cfg = config.train.get('z_calibration', None)
+    calibration_enabled = bool(
+        calibration_cfg is not None and calibration_cfg.get('enabled', False)
+    )
+    z_calibrated = not calibration_enabled
 
     # Resume
     if args.resume is not None or args.finetune is not None:
         ckpt_path = args.resume if args.resume is not None else args.finetune
         logger.info('Resuming from checkpoint: %s' % ckpt_path)
         ckpt = torch.load(ckpt_path, map_location=args.device)
-        it_first = ckpt['iteration']  # + 1
-        model.load_state_dict(ckpt['model'])
-        logger.info('Resuming optimizer states...')
-        optimizer.load_state_dict(ckpt['optimizer'])
-        logger.info('Resuming scheduler states...')
-        scheduler.load_state_dict(ckpt['scheduler'])
+        it_first = ckpt['iteration'] + 1
+        # strict=False: allow new heads (e.g. log_Z_bias) after architecture tweaks
+        missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+        if missing or unexpected:
+            logger.warning('load_state_dict strict=False; missing=%s unexpected=%s', missing, unexpected)
+        if args.resume is not None:
+            try:
+                logger.info('Resuming optimizer states...')
+                optimizer.load_state_dict(ckpt['optimizer'])
+            except ValueError as e:
+                if z_optimizer is None:
+                    raise
+                # Legacy checkpoints used one optimizer containing policy and Z
+                # parameters. Load it once, then retain only policy Adam state.
+                logger.info('Loading legacy joint optimizer state: %s', e)
+                legacy_optimizer = get_optimizer(config.train.optimizer, model)
+                legacy_optimizer.load_state_dict(ckpt['optimizer'])
+                for key, value in legacy_optimizer.param_groups[0].items():
+                    if key != 'params':
+                        optimizer.param_groups[0][key] = value
+                for param in policy_params:
+                    if param in legacy_optimizer.state:
+                        optimizer.state[param] = legacy_optimizer.state[param]
+                logger.info(
+                    'Transferred Adam state for %d policy parameters.',
+                    len(optimizer.state),
+                )
+            if z_optimizer is not None and ckpt.get('z_optimizer') is not None:
+                logger.info('Resuming Z optimizer states...')
+                z_optimizer.load_state_dict(ckpt['z_optimizer'])
+            logger.info('Resuming scheduler states...')
+            scheduler.load_state_dict(ckpt['scheduler'])
+        z_calibrated = bool(ckpt.get('z_calibrated', not calibration_enabled))
 
     def get_energies(batch_pdb_ids, energy_table):
         """Look up InterfaceAnalyzer ΔG for each complex (entry id or pdb code)."""
@@ -175,17 +230,32 @@ if __name__ == '__main__':
         time_forward_end = current_milli_time()
 
         loss.backward()
-        orig_grad_norm = clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
+        orig_grad_norm = clip_grad_norm_(policy_params, config.train.max_grad_norm)
+        if z_optimizer is not None:
+            z_grad_norm = clip_grad_norm_(
+                z_params,
+                config.train.get('z_max_grad_norm', config.train.max_grad_norm),
+            )
+        else:
+            z_grad_norm = torch.zeros((), device=args.device)
         optimizer.step()
+        if z_optimizer is not None:
+            z_optimizer.step()
         optimizer.zero_grad()
+        if z_optimizer is not None:
+            z_optimizer.zero_grad()
         time_backward_end = current_milli_time()
 
-        log_losses(loss_dict, it, 'train', logger, writer, others={
+        diagnostics = dict(model.diffusion.last_tb_diagnostics)
+        diagnostics.update({
             'grad': orig_grad_norm,
+            'z_grad': z_grad_norm,
             'lr': optimizer.param_groups[0]['lr'],
+            'z_lr': z_optimizer.param_groups[0]['lr'] if z_optimizer is not None else 0.0,
             'time_forward': (time_forward_end - time_start) / 1000,
             'time_backward': (time_backward_end - time_forward_end) / 1000,
         })
+        log_losses(loss_dict, it, 'train', logger, writer, others=diagnostics)
 
         if not torch.isfinite(loss):
             logger.error('NaN or Inf detected.')
@@ -193,11 +263,52 @@ if __name__ == '__main__':
                 'config': config,
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'z_optimizer': z_optimizer.state_dict() if z_optimizer is not None else None,
                 'scheduler': scheduler.state_dict(),
                 'iteration': it,
+                'z_calibrated': z_calibrated,
                 'batch': recursive_to(batch, 'cpu'),
             }, os.path.join(log_dir, 'checkpoint_nan_%d.pt' % it))
             raise KeyboardInterrupt()
+
+    def calibrate_log_Z(energy_table):
+        """Center the mean unclamped TB residual by shifting log_Z_bias."""
+        num_batches = int(calibration_cfg.get('num_batches', 8))
+        if num_batches <= 0:
+            raise ValueError('train.z_calibration.num_batches must be positive.')
+
+        model.eval()
+        residual_sum = 0.0
+        sample_count = 0
+        with torch.no_grad():
+            for _ in range(num_batches):
+                batch = recursive_to(next(train_iterator), args.device)
+                model(
+                    batch,
+                    energies=get_energies(batch['pdb_id'], energy_table),
+                    it=config.train.start_tb_after + 1,
+                    start_tb_after=config.train.start_tb_after,
+                )
+                diagnostics = model.diffusion.last_tb_diagnostics
+                batch_size = int(batch['aa'].size(0))
+                residual_sum += float(diagnostics['tb_residual_mean']) * batch_size
+                sample_count += batch_size
+
+        residual_mean = residual_sum / sample_count
+        bias = model.diffusion.log_Z_bias
+        bias_before = float(bias.detach())
+        with torch.no_grad():
+            bias.sub_(residual_mean)
+        logger.info(
+            'Z calibration: batches=%d samples=%d residual_mean=%.6f '
+            'bias_before=%.6f bias_after=%.6f',
+            num_batches, sample_count, residual_mean,
+            bias_before, float(bias.detach()),
+        )
+        model.train()
+        optimizer.zero_grad()
+        if z_optimizer is not None:
+            z_optimizer.zero_grad()
 
     # Validate (diffusion losses only — skip expensive TB rollouts)
     def validate(it, energy_table):
@@ -225,6 +336,9 @@ if __name__ == '__main__':
 
     try:
         for it in range(it_first, config.train.max_iters + 1):
+            if not z_calibrated and it > config.train.start_tb_after:
+                calibrate_log_Z(precomputed_energies)
+                z_calibrated = True
             train(it, energy_table=precomputed_energies)
             if it % config.train.val_freq == 0:
                 avg_val_loss = validate(it, energy_table=precomputed_energies)
@@ -234,9 +348,11 @@ if __name__ == '__main__':
                         'config': config,
                         'model': model.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'z_optimizer': z_optimizer.state_dict() if z_optimizer is not None else None,
                         'scheduler': scheduler.state_dict(),
                         'iteration': it,
                         'avg_val_loss': avg_val_loss,
+                        'z_calibrated': z_calibrated,
                     }, ckpt_path)
     except KeyboardInterrupt:
         logger.info('Terminating...')

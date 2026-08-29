@@ -6,7 +6,6 @@ model:
     num_steps: 100
     eps_net_opt:
       num_layers: 6
-    # TB partition function: conditional (default) or global (paper scalar Z)
     log_Z_mode: conditional
   train_structure: true
   train_sequence: true
@@ -16,9 +15,10 @@ train:
     rot: 1.0
     pos: 1.0
     seq: 1.0
-    tb : 1.e-7
+    tb: 0.0
   max_iters: 200_000
-  start_tb_after: 195_000
+  # Keep TB disabled for the entire 195K -> 200K continuation.
+  start_tb_after: 1_000_000_000
   val_freq: 1000
   batch_size: 16
   seed: 2022
@@ -29,16 +29,6 @@ train:
     weight_decay: 0.0
     beta1: 0.9
     beta2: 0.999
-  z_optimizer:
-    type: adam
-    lr: 1.e-2
-    weight_decay: 0.0
-    beta1: 0.9
-    beta2: 0.999
-  z_max_grad_norm: 100.0
-  z_calibration:
-    enabled: true
-    num_batches: 16
   scheduler:
     type: plateau
     factor: 0.8
@@ -49,7 +39,6 @@ dataset:
   train:
     type: sabdab
     summary_path: ./data/sabdab_summary_all.tsv
-    # FastRelax'd single-complex PDBs (same structures used for ΔG rewards)
     chothia_dir: ./data/fastrelax_cache/relaxed
     structure_name: entry_id
     processed_dir: ./data/processed_relaxed

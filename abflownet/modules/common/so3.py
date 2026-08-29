@@ -9,13 +9,15 @@ from .geometry import quaternion_to_rotation_matrix
 
 def log_rotation(R):
     trace = R[..., range(3), range(3)].sum(-1)
+    # Clamp both sides: float error can push (trace-1)/2 above 1, and then
+    # sqrt(1 - cos^2) / acos produce NaNs (this blew up TB at t=1).
     if torch.is_grad_enabled():
-        # The derivative of acos at -1.0 is -inf, so to stablize the gradient, we use -0.9999
-        min_cos = -0.999
+        # Avoid acos/sin singularities at ±1 for stable gradients.
+        cos_lo, cos_hi = -0.999, 0.999
     else:
-        min_cos = -1.0
-    cos_theta = ( (trace-1) / 2 ).clamp_min(min=min_cos)
-    sin_theta = torch.sqrt(1 - cos_theta**2)
+        cos_lo, cos_hi = -1.0 + 1e-6, 1.0 - 1e-6
+    cos_theta = ((trace - 1) / 2).clamp(min=cos_lo, max=cos_hi)
+    sin_theta = torch.sqrt((1 - cos_theta**2).clamp_min(0))
     theta = torch.acos(cos_theta)
     coef = ((theta+1e-8)/(2*sin_theta+2e-8))[..., None, None]
     logR = coef * (R - R.transpose(-1, -2))

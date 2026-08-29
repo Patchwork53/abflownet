@@ -37,13 +37,16 @@ def _gaussian_log_prob(diff, std, mask_generate, t=None, drop_t_eq_1=False):
     Continuous densities may be > 1, so log-prob can be positive — do not clamp to 0.
     When drop_t_eq_1 is set, t=1 (sigma=0, deterministic reverse step) contributes 0.
     """
-    std_safe = std.clamp_min(1e-8)
+    # Replace non-finite diffs (e.g. SO(3) log-map edge cases) before /var.
+    diff = torch.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+    std_safe = std.clamp_min(1e-5)
     var = std_safe ** 2
     log_prob = (
         -0.5 * torch.sum(diff ** 2 / var, dim=-1)
         - 0.5 * 3 * torch.log(torch.tensor(2 * np.pi, device=diff.device, dtype=diff.dtype))
         - 3 * torch.log(std_safe.squeeze(-1))
     )
+    log_prob = torch.nan_to_num(log_prob, nan=0.0, posinf=50.0, neginf=-50.0)
     if drop_t_eq_1:
         log_prob = torch.where((t > 1)[:, None], log_prob, torch.zeros_like(log_prob))
     return torch.where(mask_generate, log_prob, torch.zeros_like(log_prob))

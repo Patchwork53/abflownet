@@ -5,10 +5,15 @@ from easydict import EasyDict
 from .misc import BlackHole
 
 
-def get_optimizer(cfg, model):
+def get_optimizer(cfg, model_or_params):
+    params = (
+        model_or_params.parameters()
+        if hasattr(model_or_params, 'parameters')
+        else model_or_params
+    )
     if cfg.type == 'adam':
         return torch.optim.Adam(
-            model.parameters(),
+            params,
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             betas=(cfg.beta1, cfg.beta2, )

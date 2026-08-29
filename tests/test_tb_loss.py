@@ -48,6 +48,14 @@ def test_tb_conditional_z_grad():
     )
     tb = loss_dict['tb']
     assert tb.ndim == 0 and torch.isfinite(tb) and tb.item() >= 0.0
+    diagnostics = model.last_tb_diagnostics
+    assert {
+        'tb_residual_mean', 'tb_residual_std', 'tb_residual_rms',
+        'tb_clamp_frac', 'tb_log_Z_mean', 'tb_log_Z_std',
+        'tb_sum_log_p_mean', 'tb_sum_log_q_mean', 'tb_log_R_mean',
+    } <= diagnostics.keys()
+    assert all(torch.isfinite(value) for value in diagnostics.values())
+    assert 0.0 <= diagnostics['tb_clamp_frac'].item() <= 1.0
 
     tb.backward()
     z_grad = sum(
@@ -55,6 +63,8 @@ def test_tb_conditional_z_grad():
         for p in model.log_Z_net.parameters()
     )
     assert z_grad > 0
+    assert model.log_Z_bias.grad is not None
+    assert model.log_Z_bias.grad.abs().sum().item() > 0
     eps_grad = sum(
         (p.grad.abs().sum().item() if p.grad is not None else 0.0)
         for p in model.eps_net.parameters()
@@ -63,8 +73,11 @@ def test_tb_conditional_z_grad():
 
     with torch.no_grad():
         z1 = model._compute_log_Z(res_feat, mask_generate, mask_res)
+        model.log_Z_bias.sub_(3.5)
+        z1_shifted = model._compute_log_Z(res_feat, mask_generate, mask_res)
         z2 = model._compute_log_Z(res_feat + 1.0, mask_generate, mask_res)
         assert z1.shape == (res_feat.size(0),)
+        assert torch.allclose(z1_shifted, z1 - 3.5)
         assert not torch.allclose(z1, z2)
 
 
@@ -75,6 +88,7 @@ def test_tb_global_z_grad():
     assert model.log_Z_mode == 'global'
     assert model.log_Z is not None
     assert model.log_Z_net is None
+    assert model.log_Z_bias is not None
 
     loss_dict = model(
         v_0, p_0, s_0, res_feat, pair_feat, mask_generate, mask_res,
@@ -87,11 +101,12 @@ def test_tb_global_z_grad():
     tb.backward()
     assert model.log_Z.grad is not None
     assert model.log_Z.grad.abs().sum().item() > 0
+    assert model.log_Z_bias.grad is not None
 
     with torch.no_grad():
         z = model._compute_log_Z(res_feat, mask_generate, mask_res)
         assert z.shape == (res_feat.size(0),)
-        assert torch.allclose(z, model.log_Z.expand_as(z))
+        assert torch.allclose(z, (model.log_Z + model.log_Z_bias).expand_as(z))
 
 
 def test_tb_default_is_conditional():
@@ -107,6 +122,7 @@ def test_tb_disabled_before_schedule():
         energies=energies, it=10, start_tb_after=100,
     )
     assert loss_dict['tb'].item() == 0.0
+    assert model.last_tb_diagnostics == {}
 
 
 def test_reward_term_matches_paper():

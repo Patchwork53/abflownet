@@ -1,6 +1,6 @@
 mode: single_cdr
 model:
-  checkpoint: ./logs/codesign_single_2026_08_01__12_38_25_abflownet_relaxed/checkpoints/200000.pt
+  checkpoint: ./logs/codesign_single_no_tb_after_195k_ablation/checkpoints/200000.pt
 
 sampling:
   seed: 2022

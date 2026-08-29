@@ -131,6 +131,7 @@ class FullDPM(nn.Module):
         self.register_buffer('position_mean', torch.FloatTensor(position_mean).view(1, 1, -1))
         self.register_buffer('position_scale', torch.FloatTensor(position_scale).view(1, 1, -1))
         self.register_buffer('_dummy', torch.empty([0, ]))
+        self.last_tb_diagnostics = {}
 
         # TB partition function: 'conditional' (default) or 'global' (paper scalar).
         if log_Z_mode not in ('conditional', 'global'):
@@ -138,8 +139,11 @@ class FullDPM(nn.Module):
                 f"log_Z_mode must be 'conditional' or 'global', got {log_Z_mode!r}"
             )
         self.log_Z_mode = log_Z_mode
+        # Shared learnable offset so Z can match the large Σ log p − Σ log q scale
+        # quickly (trajectory sums are O(10^3–10^5); the MLP alone starts near 0).
+        self.log_Z_bias = nn.Parameter(torch.zeros(1))
         if log_Z_mode == 'conditional':
-            # log Z_θ(x): per antigen/framework context
+            # log Z_θ(x) = net(context) + bias
             self.log_Z_net = nn.Sequential(
                 nn.Linear(res_feat_dim, res_feat_dim),
                 nn.SiLU(),
@@ -147,7 +151,7 @@ class FullDPM(nn.Module):
             )
             self.log_Z = None
         else:
-            # Single scalar Z over the whole distribution (paper)
+            # Paper-style single scalar (plus bias kept for a uniform API).
             self.log_Z = nn.Parameter(torch.zeros(1))
             self.log_Z_net = None
 
@@ -160,14 +164,14 @@ class FullDPM(nn.Module):
         return p
 
     def _conditional_log_Z(self, res_feat, mask_generate, mask_res):
-        """log Z_θ(x) from pooled context residues (not the generated CDR).
+        """Context-dependent term of log Z_θ(x) (bias added in _compute_log_Z).
 
         Args:
             res_feat: (N, L, D)
             mask_generate: (N, L) True on designed CDR sites
             mask_res: (N, L) True on valid residues
         Returns:
-            log_Z: (N,)
+            log_Z_ctx: (N,)
         """
         ctx_mask = mask_res & ~mask_generate
         denom = ctx_mask.sum(dim=1, keepdim=True).clamp(min=1).to(res_feat.dtype)
@@ -177,9 +181,10 @@ class FullDPM(nn.Module):
     def _compute_log_Z(self, res_feat, mask_generate, mask_res):
         """Return log Z with shape (N,) for the active log_Z_mode."""
         N = res_feat.shape[0]
+        bias = self.log_Z_bias.expand(N)
         if self.log_Z_mode == 'conditional':
-            return self._conditional_log_Z(res_feat, mask_generate, mask_res)
-        return self.log_Z.expand(N)
+            return self._conditional_log_Z(res_feat, mask_generate, mask_res) + bias
+        return self.log_Z.expand(N) + bias
 
     def _trajectory_balance_loss(
         self,
@@ -266,7 +271,30 @@ class FullDPM(nn.Module):
 
         sum_log_p = torch.stack(backward_logprob, dim=1).sum(dim=1)
         residual = log_Z + sum_log_p - log_R - sum_log_q
-        return (residual ** 2).mean()
+        # Float32 safety; raised clamp so Z-bias can pull residual down before
+        # saturating. With w_TB ~ 1e-7, L_TB ≤ 1e8 → weighted ≤ 10.
+        residual_unclamped = torch.nan_to_num(
+            residual, nan=0.0, posinf=1e4, neginf=-1e4,
+        )
+        finite_log_Z = torch.nan_to_num(log_Z, nan=0.0, posinf=1e4, neginf=-1e4)
+        finite_sum_log_p = torch.nan_to_num(sum_log_p, nan=0.0, posinf=1e4, neginf=-1e4)
+        finite_sum_log_q = torch.nan_to_num(sum_log_q, nan=0.0, posinf=1e4, neginf=-1e4)
+        finite_log_R = torch.nan_to_num(log_R, nan=0.0, posinf=1e4, neginf=-1e4)
+        self.last_tb_diagnostics = {
+            'tb_residual_mean': residual_unclamped.mean().detach(),
+            'tb_residual_std': residual_unclamped.std(unbiased=False).detach(),
+            'tb_residual_rms': residual_unclamped.square().mean().sqrt().detach(),
+            'tb_clamp_frac': (
+                (~torch.isfinite(residual)) | (residual.abs() > 1e4)
+            ).float().mean().detach(),
+            'tb_log_Z_mean': finite_log_Z.mean().detach(),
+            'tb_log_Z_std': finite_log_Z.std(unbiased=False).detach(),
+            'tb_sum_log_p_mean': finite_sum_log_p.mean().detach(),
+            'tb_sum_log_q_mean': finite_sum_log_q.mean().detach(),
+            'tb_log_R_mean': finite_log_R.mean().detach(),
+        }
+        residual_clamped = residual_unclamped.clamp(-1e4, 1e4)
+        return residual_clamped.square().mean()
 
     def forward(self, v_0, p_0, s_0, res_feat, pair_feat, mask_generate, mask_res, denoise_structure, denoise_sequence, energies, it, start_tb_after):
         N, L = res_feat.shape[:2]
@@ -282,6 +310,7 @@ class FullDPM(nn.Module):
                 energies,
             )
         else:
+            self.last_tb_diagnostics = {}
             loss_dict['tb'] = torch.zeros((), device=device)
 
         # DiffAb denoising losses at a random timestep (independent of TB trajectory)
